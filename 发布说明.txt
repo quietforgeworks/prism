@@ -1,0 +1,6 @@
+Prism 1.0.8
+仅支持 macOS 26 及以上、Apple Silicon（arm64）Mac。
+应用使用 ad-hoc 本地签名，未使用 Apple Developer ID 签名，未通过 Apple 公证。首次打开可能被 macOS 阻止。
+本包附应用、源码、构建脚本及 MIT 许可证。详情见 README.md 和 Source/README.md。
+本包未附原用户的历史数据库或本机配置；安装到已有同名应用的电脑时，可能继续使用原有本地数据。
+Prism 默认采集剪贴板；本地数据库和备份没有应用层加密。“清空历史”不删除收藏、所有缓存和导出备份。链接预览和打开链接会联网。请先阅读 Source/PRIVACY.md。
