@@ -1,49 +1,57 @@
 # Prism 1.0.8
 
-面向 macOS 的本地菜单栏剪贴板工具，支持历史检索、分类与收藏、图片文字识别、备份导入导出和快捷粘贴。
+Prism is a macOS menu bar clipboard manager with searchable history, categories, favorites, image OCR, backup import and export, and quick paste.
 
-## 系统要求与分发状态
+## Requirements and installation
 
-- **macOS 26 及以上，仅支持 Apple Silicon（arm64）Mac。**
-- 当前下载包使用 ad-hoc 本地签名，**未使用 Apple Developer ID 签名，未通过 Apple 公证**。macOS 可能阻止首次打开；请先核验下载来源和 SHA-256。不要关闭系统安全保护或全局禁用 Gatekeeper。
-- 这是直接下载分发的应用，不是 Mac App Store 安装包。Intel Mac 和较旧 macOS 不受此版本支持。
-- 验证范围：尚未完成独立的全新 Mac 安装、升级和权限回归测试。
+- macOS 26 or later on Apple Silicon (arm64).
+- The downloadable app uses an ad-hoc signature and is not Apple-notarized. macOS may require approval on first launch.
+- Extract the release ZIP and move `Prism.app` to Applications.
 
-## 安装与开始使用
+Open history from the menu bar or with the default shortcut ⇧⌘V. The copy queue uses ⇧⌘C. Shortcuts can be changed in settings.
 
-解压发布 ZIP，将 Prism.app 放入“应用程序”后打开。使用菜单栏图标或默认快捷键 ⇧⌘V 查看历史；⇧⌘C 用于复制队列。快捷键可在设置中调整。
+Prism starts recording newly copied content when launched. Automatic paste requires the relevant macOS event-sending or Accessibility permission. Without it, copy an entry and paste manually with ⌘V.
 
-应用打开后默认开始记录新复制的剪贴板内容。自动粘贴需要 macOS 的相应事件发送/辅助功能许可；不授予时可复制条目并手动按 ⌘V。请只授予你理解并需要的权限。
+## Storage and retention
 
-## 隐私与数据
+- Default limits are 30 days, 1,000 history entries, and 512 MB. Settings provide retention controls, pause, application exclusions, and history cleanup.
+- Clipboard text, images, file references, source-app details, and local search/OCR data are stored under `~/Library/Application Support/Prism/`.
+- Storage uses local SQLite and files, with permissions such as 0700 for directories and 0600 for files. The database and exported `.prismbackup` files have no application-level encryption.
+- Common password-manager exclusions, secure-input pause, and sensitive clipboard-type filtering are included. Ordinary copied text can still contain sensitive data; recording can be paused.
+- Clear History preserves favorites. Image drag files use a separate temporary cache with a default 24-hour retention period. Cleanup is not immediate secure erasure. Migration archives and exported backups are separate from history cleanup.
 
-- 默认保留期限为 30 天，历史数量上限 1000 条，磁盘额度 512 MB；可以在设置中调整、暂停采集、排除应用和清理历史。收藏及独立缓存不应理解为受到所有历史清理动作覆盖。
-- 剪贴板正文、图片、文件引用、来源应用和本地检索/OCR 信息可能包含敏感内容。主数据存放在 `~/Library/Application Support/Prism/`。
-- 使用本地 SQLite 和文件保存内容，以目录 0700/文件 0600 等权限限制其他用户访问；**没有应用层数据库或备份加密**。二进制 plist 也不是加密。请自行保护设备、系统备份和导出的 `.prismbackup` 文件。
-- 内置常见密码管理器排除、安全输入暂停和敏感剪贴板类型过滤；这些措施无法保证识别普通浏览器、编辑器或其他应用中复制的所有密码、令牌和个人资料。处理敏感内容前请主动暂停采集。
-- “清空历史”保留收藏。图片拖拽文件有独立临时缓存，默认保留期为 24 小时，并非到时立即安全擦除。旧版本迁移可能保留旧档案，用户导出的备份也不会随历史清空删除。
-- 未发现向开发者服务器自动上传剪贴板历史或遥测的实现。**链接预览会通过内置 WebKit 联网请求所选 URL；“打开链接”会交给默认浏览器。**目标网站及其页面资源可收到 URL、出口 IP 和常规浏览器请求信息。内置预览采用非持久化网站数据存储，但这不等于匿名或无网络访问。详见 [PRIVACY.md](PRIVACY.md)。
+## Link previews and network access
 
-## 升级与卸载
+Link previews load the selected URL and its page resources through WebKit, using nonpersistent website storage. These requests expose the normal URL, IP address, and browser-request information to the destination. Open Link uses the default browser.
 
-先退出旧版本再替换应用；建议在升级前通过应用导出备份并妥善保管。新版会使用同名应用的既有本地数据。删除 Prism.app 不会自动删除历史、收藏、偏好设置、拖拽缓存或已导出的备份。清理数据前请确认保留需求；本项目不承诺安全擦除或移除系统备份中的副本。
+There is no implementation for automatically uploading clipboard history or telemetry to a developer server. See [PRIVACY.md](PRIVACY.md) for the full data behavior.
 
-## 源码、构建与测试
+## Updating and removing the app
 
-需要支持 macOS 26 SDK 的 Xcode/命令行工具和 Swift 6 工具链。在本源码目录运行：
+Quit the old version before replacing it. The new version reuses the app's local data. Backup export is available before upgrading.
+
+Removing `Prism.app` leaves history, favorites, preferences, drag caches, and exported backups in place. Application cleanup does not remove copies in system backups.
+
+## Build and test
+
+Use Xcode or command-line tools with the macOS 26 SDK and a Swift 6 toolchain. From this directory, run:
 
 ```sh
 ./Build.command
 ```
 
-脚本构建 Release 应用并进行 ad-hoc 签名。原生依赖为 Apple 系统框架与系统 SQLite，无外部 Swift 包依赖。构建成功后，可在 Mac 上运行生成应用的自测：
+The script builds a release app and applies an ad-hoc signature. Dependencies are Apple system frameworks and system SQLite, with no external Swift packages.
+
+Run the generated app's self-test on a Mac:
 
 ```sh
 ../Prism.app/Contents/MacOS/Prism --self-test
 ```
 
-自测是功能检查的一部分，不能代替真实安装、权限和隐私验证。以上构建与自测尚未在独立验证环境复核。
+## Current limitations and next steps
 
-## 许可与来源
+Intel Macs and older macOS versions are not supported. Independent fresh-install, upgrade, permission, build, and self-test validation remain incomplete. The next development step is broader installation and permission testing across supported Macs.
 
-项目按 MIT 许可证发布，见 [LICENSE](LICENSE)。MIT 不授予 Apple 商标、系统框架或第三方内容的额外权利。依赖和来源说明见 [THIRD-PARTY.md](THIRD-PARTY.md)。
+## License and sources
+
+Released under the [MIT license](LICENSE). Apple trademarks, system frameworks, and third-party content retain their respective rights. See [THIRD-PARTY.md](THIRD-PARTY.md) for dependencies and sources.
