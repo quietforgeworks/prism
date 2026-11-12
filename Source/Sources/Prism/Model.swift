@@ -33,7 +33,11 @@ struct Payload: Codable, Equatable {
     }
     func pasteboardItem() -> NSPasteboardItem {
         let item = NSPasteboardItem()
-        for (type, bytes) in types { item.setData(bytes, forType: .init(type)) }
+        for (type, bytes) in types {
+            let name = type.contains("/") ? UTType(mimeType: type)?.identifier : type
+            if let name, name != type, types[name] != nil { continue }
+            if let name { item.setData(bytes, forType: .init(name)) }
+        }
         return item
     }
 }
@@ -181,6 +185,7 @@ struct Clip: Codable, Identifiable {
     var bundle: String
     var title = ""
     var boardIDs: [UUID] = []
+    var transferFileAccess: TransferFileAccess?
     private var inlinePayloads: [Payload]?
     private var location: ClipLocation?
     private var fingerprintBox = FingerprintBox()
@@ -220,27 +225,35 @@ struct Clip: Codable, Identifiable {
     // Keep the stored payload untouched and preserve every non-file item's UTIs.
     func pasteboardWriters(forDragging: Bool = false) throws -> [NSPasteboardWriting] {
         try loadPayloads().flatMap { payload -> [NSPasteboardWriting] in
-            let urls: [NSURL]
-            if payload.data(.fileURL) != nil {
-                guard let value = payload.string(.fileURL), let url = NSURL(string: value), url.isFileURL else {
-                    throw StorageError.message("记录中的文件地址无效，请重新复制原文件。")
-                }
-                urls = [url]
-            } else if let data = payload.types["NSFilenamesPboardType"] {
-                guard let paths = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String],
-                      !paths.isEmpty, paths.allSatisfy({ ($0 as NSString).isAbsolutePath }) else {
-                    throw StorageError.message("记录中的文件路径列表无效，请重新复制原文件。")
-                }
-                urls = paths.map { NSURL(fileURLWithPath: $0) }
-            } else if let value = payload.string(.URL), let url = NSURL(string: value), url.isFileURL {
-                urls = [url]
-            } else {
-                if forDragging, let promise = ImageDragPromiseProvider(payload: payload) {
-                    return [promise]
-                }
+            let stored = try payload.storedTransferFiles()
+            // Prefer the complete image carried on the clipboard over a
+            // source app's temporary path, including records from older builds.
+            let fileBacked = payload.data(.fileURL) != nil || payload.types[Payload.legacyFilesType] != nil
+            if stored.isEmpty, let image = payload.replayImage(addPNG: !forDragging || fileBacked) {
+                let needsFile = forDragging || image.hasMultipleImageFrames || (image.data(.png) == nil && image.data(.tiff) == nil)
+                if needsFile, let promise = ClipFilePromiseProvider(payload: image) { return [promise] }
+                return [image.pasteboardItem()]
+            }
+            let urls = try payload.transferFileURLs()
+            if urls.isEmpty {
+                if let promise = ClipFilePromiseProvider(payload: payload) { return [promise] }
                 return [payload.pasteboardItem()]
             }
             return try urls.map { url -> NSPasteboardWriting in
+                if let file = stored.first(where: { $0.originalURL == url.absoluteString }) {
+                    let type = UTType(filenameExtension: (file.name as NSString).pathExtension) ?? .data
+                    var contents = Payload(types: [type.identifier: file.contents])
+                    if type.conforms(to: .image) {
+                        for (name, bytes) in payload.types where Payload.imageType(name) != nil {
+                            if contents.types[name] == nil { contents.types[name] = bytes }
+                        }
+                        if !forDragging, let image = contents.replayImage(addPNG: true) {
+                            if !image.hasMultipleImageFrames, image.data(.png) != nil || image.data(.tiff) != nil { return image.pasteboardItem() }
+                            contents = image
+                        }
+                    }
+                    return ClipFilePromiseProvider(payload: contents, bytes: file.contents, type: type, filename: file.name)
+                }
                 // Finder can supply file:///.file/id=… references. Resolve those
                 // before testing existence or standardizing a filesystem path.
                 guard let pathURL = url.filePathURL?.standardizedFileURL,
@@ -260,7 +273,10 @@ struct Clip: Codable, Identifiable {
     var isDiskBound: Bool { location != nil && inlinePayloads == nil }
     var typeNames: [String] { typeValues }
     var byteCount: Int { bytesValue }
-    var kind: String { kindValue }
+    var kind: String {
+        if kindValue == "文件", Payload.representsInlineImage(typeNames: typeValues, files: fileValues) { return "图片" }
+        return kindValue
+    }
     var textPreview: String { previewValue }
     var heading: String { title.isEmpty ? (kind == "文件" ? "\(fileCount) 个文件" : kind) : title }
     var text: String {
@@ -278,7 +294,13 @@ struct Clip: Codable, Identifiable {
         }
     }
     var searchable: String { [title, text, source, bundle, recognizedText, files.map(\.path).joined(separator: " ")].joined(separator: " ") }
-    var pdf: Data? { payloads.lazy.compactMap { $0.data(.pdf) }.first }
+    var pdf: Data? {
+        for payload in payloads {
+            if let data = payload.data(.pdf) { return data }
+            if let file = (try? payload.storedTransferFiles())?.first(where: { $0.name.lowercased().hasSuffix(".pdf") }) { return file.contents }
+        }
+        return nil
+    }
     // Preview images are intentionally bounded; edits should use original payloads.
     var image: NSImage? { thumbnail(maxPixelSize: 1600) }
     func thumbnail(maxPixelSize: Int = 600) -> NSImage? {
@@ -298,7 +320,7 @@ struct Clip: Codable, Identifiable {
         countValue = payloads.count
         bytesValue = payloads.reduce(0) { $0 + $1.types.values.reduce(0) { $0 + $1.count } }
         typeValues = Array(Set(payloads.flatMap { $0.types.keys })).sorted()
-        fileValues = payloads.compactMap { $0.string(.fileURL).flatMap(URL.init(string:)) }
+        fileValues = payloads.flatMap { ((try? $0.transferFileURLs()) ?? []).map { $0 as URL } }
         let plain = payloads.compactMap { item -> String? in
             if let bytes = item.data(.string) { return String(decoding: bytes.prefix(8192), as: UTF8.self) }
             for type in ["public.utf16-external-plain-text", "public.utf16-plain-text", "public.plain-text"] {
@@ -310,7 +332,8 @@ struct Clip: Codable, Identifiable {
             return item.string(.URL)
         }.joined(separator: "\n")
         previewValue = String(plain.prefix(2048)); characterCountValue = plain.count
-        if !fileValues.isEmpty { kindValue = "文件" }
+        if Payload.representsInlineImage(typeNames: typeValues, files: fileValues) { kindValue = "图片" }
+        else if !fileValues.isEmpty { kindValue = "文件" }
         else if typeValues.contains(NSPasteboard.PasteboardType.png.rawValue) || typeValues.contains(NSPasteboard.PasteboardType.tiff.rawValue) || typeValues.contains(where: Self.isImageType) { kindValue = "图片" }
         else if typeValues.contains(NSPasteboard.PasteboardType.pdf.rawValue) { kindValue = "PDF" }
         else if typeValues.contains(NSPasteboard.PasteboardType.URL.rawValue) || plain.trimmingCharacters(in: .whitespacesAndNewlines).range(of: "^https?://\\S+$", options: .regularExpression) != nil { kindValue = "链接" }
@@ -319,9 +342,9 @@ struct Clip: Codable, Identifiable {
         else { kindValue = "数据" }
     }
     fileprivate static func isImageType(_ type: String) -> Bool {
-        UTType(type)?.conforms(to: .image) == true && type != NSPasteboard.PasteboardType.pdf.rawValue
+        Payload.imageType(type) != nil
     }
-    fileprivate static func extractText(_ payloads: [Payload]) -> String {
+    static func extractText(_ payloads: [Payload]) -> String {
         payloads.compactMap { item -> String? in
             if let string = item.string(.string) { return string }
             for type in ["public.utf16-external-plain-text", "public.utf16-plain-text", "public.plain-text"] {
@@ -358,7 +381,15 @@ struct Clip: Codable, Identifiable {
         ] as CFDictionary)
     }
     fileprivate static func makeThumbnail(_ payloads: [Payload], size: Int) -> CGImage? {
-        for item in payloads {
+        let contents = payloads.flatMap { item -> [Payload] in
+            let stored = ((try? item.storedTransferFiles()) ?? []).compactMap { file -> Payload? in
+                guard let type = UTType(filenameExtension: (file.name as NSString).pathExtension),
+                      type.conforms(to: .image) || type == .pdf else { return nil }
+                return Payload(types: [type.identifier: file.contents])
+            }
+            return [item] + stored
+        }
+        for item in contents {
             let names = [NSPasteboard.PasteboardType.png.rawValue, NSPasteboard.PasteboardType.tiff.rawValue] + item.types.keys.filter(isImageType)
             for type in names {
                 if let bytes = item.types[type], let source = CGImageSourceCreateWithData(bytes as CFData, [kCGImageSourceShouldCache: false] as CFDictionary), let image = downsample(source, size: size) { return image }
@@ -426,7 +457,7 @@ struct Clip: Codable, Identifiable {
 }
 struct Archive: Codable { var version = 1; var clips: [Clip]; var boards: [Board] }
 
-private enum StorageError: LocalizedError {
+enum StorageError: LocalizedError {
     case message(String)
     var errorDescription: String? { if case .message(let message) = self { return message }; return nil }
 }
@@ -634,7 +665,13 @@ final class ClipStore {
             }
             if !types.isEmpty { payloads.append(Payload(types: types)) }
         }
-        return payloads.isEmpty ? nil : Clip(source: source, bundle: bundle, payloads: payloads)
+        guard !payloads.isEmpty else { return nil }
+        var clip = Clip(source: source, bundle: bundle, payloads: payloads)
+        if !clip.files.isEmpty {
+            let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+            clip.transferFileAccess = TransferFileAccess(urls)
+        }
+        return clip
     }
     @discardableResult func add(_ clip: Clip, board: UUID? = nil) -> UUID {
         guard clip.byteCount <= Self.maxBytes else {

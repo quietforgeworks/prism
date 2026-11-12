@@ -40,6 +40,7 @@ final class ThumbnailCache {
     }
     private struct Subscriber {
         let token: ImageSubscription
+        let isPrefetch: Bool
         let completion: (NSImage?) -> Void
     }
     private final class Job {
@@ -47,15 +48,23 @@ final class ThumbnailCache {
         let id = UUID()
         let key: String
         let input: Input
+        var isPrefetch: Bool
         var subscribers: [UUID: Subscriber] = [:]
         var phase = Phase.queued
         var request: QLThumbnailGenerator.Request?
         var timeout: DispatchWorkItem?
-        init(key: String, input: Input) { self.key = key; self.input = input }
+        init(key: String, input: Input, isPrefetch: Bool) {
+            self.key = key; self.input = input; self.isPrefetch = isPrefetch
+        }
     }
     private var jobs: [String: Job] = [:]
     private var pending: [[Job]] = [[], []]
     private var active: [[UUID: Job]] = [[:], [:]]
+    var outstandingRequestCount: Int { jobs.count }
+    var activeThumbnailWork: (visible: Int, prefetch: Int) {
+        let prefetch = active[0].values.filter(\.isPrefetch).count
+        return (active[0].count - prefetch, prefetch)
+    }
 
     init() {
         images.totalCostLimit = 20 * 1024 * 1024
@@ -73,11 +82,11 @@ final class ThumbnailCache {
     func key(_ clip: Clip) -> NSString { "\(clip.id)-\(clip.fingerprint)" as NSString }
 
     @discardableResult
-    func load(_ clip: Clip, completion: @escaping (NSImage?) -> Void) -> Operation? {
+    func load(_ clip: Clip, prefetch: Bool = false, completion: @escaping (NSImage?) -> Void) -> Operation? {
         precondition(Thread.isMainThread)
         let cacheKey = key(clip)
         if let image = images.object(forKey: cacheKey) { completion(image); return nil }
-        return subscribe(key: "thumbnail:\(cacheKey)", input: .thumbnail(clip), completion: completion)
+        return subscribe(key: "thumbnail:\(cacheKey)", input: .thumbnail(clip), prefetch: prefetch, completion: completion)
     }
 
     @discardableResult
@@ -88,13 +97,14 @@ final class ThumbnailCache {
         return subscribe(key: "icon:\(bundle)", input: .icon(bundle), completion: completion)
     }
 
-    private func subscribe(key: String, input: Input, completion: @escaping (NSImage?) -> Void) -> Operation? {
+    private func subscribe(key: String, input: Input, prefetch: Bool = false, completion: @escaping (NSImage?) -> Void) -> Operation? {
         let job: Job
         if let existing = jobs[key] {
             // Even callers that forget to cancel cannot grow a single-flight
             // request's callback list without a bound.
             guard existing.subscribers.count < maximumSubscribers else { completion(nil); return nil }
             job = existing
+            if !prefetch { job.isPrefetch = false }
         } else {
             let lane = input.lane
             // Prefer recently visible cards if requests arrive faster than
@@ -102,7 +112,7 @@ final class ThumbnailCache {
             if pending[lane].count >= maximumPending, let oldest = pending[lane].first {
                 finish(oldest, image: nil)
             }
-            job = Job(key: key, input: input)
+            job = Job(key: key, input: input, isPrefetch: prefetch)
             jobs[key] = job
             pending[lane].append(job)
         }
@@ -113,7 +123,7 @@ final class ThumbnailCache {
             if Thread.isMainThread { cancel() }
             else { DispatchQueue.main.async { cancel() } }
         }
-        job.subscribers[subscriberID] = Subscriber(token: token, completion: completion)
+        job.subscribers[subscriberID] = Subscriber(token: token, isPrefetch: prefetch, completion: completion)
         startAvailableJobs(in: input.lane)
         return token
     }
@@ -121,13 +131,15 @@ final class ThumbnailCache {
     private func startAvailableJobs(in lane: Int) {
         let concurrency = lane == 0 ? 2 : 1
         while active[lane].count < concurrency, !pending[lane].isEmpty {
-            let job = pending[lane].removeFirst()
+            let next = pending[lane].firstIndex { !$0.isPrefetch } ?? pending[lane].startIndex
+            if pending[lane][next].isPrefetch, active[lane].values.contains(where: \.isPrefetch) { break }
+            let job = pending[lane].remove(at: next)
             guard job.phase == .queued, !job.subscribers.isEmpty else { continue }
             job.phase = .decoding
             active[lane][job.id] = job
             switch job.input {
             case .thumbnail(let clip):
-                thumbnailQueue.addOperation { [weak self, job] in
+                let operation = BlockOperation { [weak self, job] in
                     let result: (NSImage?, URL?) = autoreleasepool {
                         if let image = clip.thumbnail(maxPixelSize: 640) { return (image, nil) }
                         if let url = clip.files.first, FileManager.default.fileExists(atPath: url.path) { return (nil, url) }
@@ -135,6 +147,9 @@ final class ThumbnailCache {
                     }
                     DispatchQueue.main.async { self?.decoded(job, image: result.0, file: result.1) }
                 }
+                operation.qualityOfService = job.isPrefetch ? .utility : .userInitiated
+                operation.queuePriority = job.isPrefetch ? .low : .normal
+                thumbnailQueue.addOperation(operation)
             case .icon(let bundle):
                 iconQueue.addOperation { [weak self, job] in
                     let image: NSImage? = autoreleasepool {
@@ -185,7 +200,10 @@ final class ThumbnailCache {
     private func cancel(key: String, jobID: UUID, subscriberID: UUID) {
         guard let job = jobs[key], job.id == jobID else { return }
         job.subscribers.removeValue(forKey: subscriberID)
-        guard job.subscribers.isEmpty else { return }
+        guard job.subscribers.isEmpty else {
+            job.isPrefetch = job.subscribers.values.allSatisfy(\.isPrefetch)
+            return
+        }
         jobs.removeValue(forKey: key)
         if job.phase == .decoding {
             // A synchronous ImageIO/Workspace call cannot be interrupted. Keep

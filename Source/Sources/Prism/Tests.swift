@@ -6,11 +6,11 @@ import QuartzCore
 
 // Run explicitly with --self-test. These tests use only private pasteboards and
 // disposable storage; they never show the shelf or touch the general board.
-private struct SelfTestFailure: Error, CustomStringConvertible {
+struct SelfTestFailure: Error, CustomStringConvertible {
     let description: String
 }
 
-private func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
+func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
     if try !condition() { throw SelfTestFailure(description: message) }
 }
 
@@ -20,7 +20,7 @@ private func withTestPasteboard<T>(_ body: (NSPasteboard) throws -> T) rethrows 
     return try body(board)
 }
 
-private func waitFor(_ message: String, timeout: TimeInterval = 5, _ condition: () -> Bool) throws {
+func waitFor(_ message: String, timeout: TimeInterval = 5, _ condition: () -> Bool) throws {
     let deadline = Date().addingTimeInterval(timeout)
     while !condition(), Date() < deadline {
         _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
@@ -34,7 +34,7 @@ private func textClip(_ text: String, source: String = "Self Test") -> Clip {
     ])
 }
 
-private func tinyImageData() throws -> (png: Data, tiff: Data) {
+func tinyImageData() throws -> (png: Data, tiff: Data) {
     guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 3, pixelsHigh: 2,
         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else {
@@ -53,7 +53,7 @@ private func tinyImageData() throws -> (png: Data, tiff: Data) {
     return (png, tiff)
 }
 
-private func dragImageData(width: Int, height: Int, format: NSBitmapImageRep.FileType) throws -> Data {
+func dragImageData(width: Int, height: Int, format: NSBitmapImageRep.FileType) throws -> Data {
     guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0), let pixels = bitmap.bitmapData else {
@@ -88,7 +88,7 @@ private final class PromiseWriteObservation {
     }
 }
 
-private func deliverImagePromise(_ provider: ImageDragPromiseProvider, to destination: URL) throws -> Error? {
+private func deliverImagePromise(_ provider: ClipFilePromiseProvider, to destination: URL) throws -> Error? {
     let queue = provider.operationQueue(for: provider)
     try require(queue !== OperationQueue.main, "Image file delivery uses the main operation queue")
     let observation = PromiseWriteObservation()
@@ -103,9 +103,9 @@ private func deliverImagePromise(_ provider: ImageDragPromiseProvider, to destin
     return result.error
 }
 
-private func imagePromise(_ clip: Clip) throws -> ImageDragPromiseProvider {
+private func imagePromise(_ clip: Clip) throws -> ClipFilePromiseProvider {
     let writers = try clip.pasteboardWriters(forDragging: true)
-    guard writers.count == 1, let provider = writers[0] as? ImageDragPromiseProvider else {
+    guard writers.count == 1, let provider = writers[0] as? ClipFilePromiseProvider else {
         throw SelfTestFailure(description: "Image drag did not preserve a native file promise provider")
     }
     return provider
@@ -176,6 +176,7 @@ func runSelfTests() -> Int32 {
     func run(_ name: String, _ body: () throws -> Void) {
         do { try autoreleasepool(invoking: body); passed += 1; print("PASS: \(name)") }
         catch { failed += 1; print("FAIL: \(name): \(error)") }
+        fflush(stdout)
     }
     func directory(_ name: String) -> URL { root.appendingPathComponent(name, isDirectory: true) }
 
@@ -403,7 +404,7 @@ func runSelfTests() -> Int32 {
             try require(Set(advertised).count == advertised.count, "Image drag advertises a format more than once")
             try require(board.writeObjects([provider]), "Could not write marked image promise to private pasteboard")
             guard let item = board.pasteboardItems?.first else { throw SelfTestFailure(description: "Image promise pasteboard item is missing") }
-            try require(item.string(forType: ImageDragPromiseProvider.clipIDType) == ids, "Image promise lost multi-selection identity")
+            try require(item.string(forType: ClipFilePromiseProvider.clipIDType) == ids, "Image promise lost multi-selection identity")
             try require(nativeTypes.isSubset(of: Set(item.types)), "Writing internal metadata removed native promise types")
             for (type, bytes) in payload.types {
                 try require(item.data(forType: .init(type)) == bytes, "Image destination cannot read original \(type)")
@@ -494,7 +495,7 @@ func runSelfTests() -> Int32 {
     }
 
     run("image file drag cache is bounded and preserves delayed receiver access") {
-        try testImageDragFileCache(directory: directory("image-drag-file-cache"))
+        try testTransferFileCache(directory: directory("image-drag-file-cache"))
     }
 
     run("image drag supplies one native existing file URL with exact original image formats") {
@@ -503,14 +504,14 @@ func runSelfTests() -> Int32 {
         let payload = Payload(types: ["public.png": png, "public.tiff": tiff])
         let clip = Clip(source: "Chat File Drop Fixture", bundle: "", payloads: [payload])
         let original = try clip.pasteboardWriters(forDragging: true)
-        let cache = ImageDragFileCache(directory: directory("chat-drop-export"))
+        let cache = TransferFileCache(directory: directory("chat-drop-export"))
         var prepared: Result<[NSPasteboardWriting], Error>?
-        ImageDragPreparation.prepare(original, cache: cache) { prepared = $0 }
+        FileTransferPreparation.prepare(original, cache: cache) { prepared = $0 }
         try waitFor("Image file preparation did not complete") { prepared != nil }
         let writers = try prepared!.get()
-        try require(writers.count == 1 && writers[0] is ImageFileDragWriter,
+        try require(writers.count == 1 && writers[0] is ClipFileWriter,
                     "One image did not become exactly one native file writer")
-        let writer = writers[0] as! ImageFileDragWriter
+        let writer = writers[0] as! ClipFileWriter
         try require(writer.fileURL.pathExtension == "png", "Image file has wrong original encoding extension")
         try require(try Data(contentsOf: writer.fileURL) == png, "Prepared PNG differs from original encoded bytes")
         let ids = clip.id.uuidString
@@ -522,7 +523,7 @@ func runSelfTests() -> Int32 {
             let item = board.pasteboardItems![0]
             try require(item.data(forType: .png) == png && item.data(forType: .tiff) == tiff,
                         "Native image consumers lost their original raw formats")
-            try require(item.string(forType: ImageDragPromiseProvider.clipIDType) == ids,
+            try require(item.string(forType: ClipFilePromiseProvider.clipIDType) == ids,
                         "Image file drag lost collection identity")
             let promise = try imagePromise(clip)
             let promiseTypes = NSFilePromiseProvider(fileType: promise.fileType, delegate: promise).writableTypes(for: board)
@@ -540,14 +541,14 @@ func runSelfTests() -> Int32 {
         let sentinel = Data("retained source".utf8); try sentinel.write(to: file)
         let inputs: [NSPasteboardWriting] = [file as NSURL] + (try image.pasteboardWriters(forDragging: true))
         var prepared: Result<[NSPasteboardWriting], Error>?
-        ImageDragPreparation.prepare(inputs, cache: ImageDragFileCache(directory: directory("mixed-image-export"))) { prepared = $0 }
+        FileTransferPreparation.prepare(inputs, cache: TransferFileCache(directory: directory("mixed-image-export"))) { prepared = $0 }
         try waitFor("Mixed drag preparation did not complete") { prepared != nil }
         let writers = try prepared!.get()
-        try require(writers.count == 2 && (writers[0] as? NSURL) == (file as NSURL) && writers[1] is ImageFileDragWriter,
+        try require(writers.count == 2 && (writers[0] as? NSURL) == (file as NSURL) && writers[1] is ClipFileWriter,
                     "Mixed drag changed file order or item count")
         try require(try Data(contentsOf: file) == sentinel, "Mixed drag modified original native file")
         var failed: Result<[NSPasteboardWriting], Error>?
-        ImageDragPreparation.prepare(inputs, cache: ImageDragFileCache(directory: directory("export-capacity"), byteLimit: 1)) { failed = $0 }
+        FileTransferPreparation.prepare(inputs, cache: TransferFileCache(directory: directory("export-capacity"), byteLimit: 1)) { failed = $0 }
         try waitFor("Failed image export never completed") { failed != nil }
         if case .success = failed! { throw SelfTestFailure(description: "Partial image preparation was published as success") }
         try require(try Data(contentsOf: file) == sentinel, "Failed preparation changed native source")
@@ -557,58 +558,30 @@ func runSelfTests() -> Int32 {
         try testAppearancePreferences()
     }
 
-    run("shelf slide driver traverses intermediate positions and reaches its target") {
-        // Exercise the same timer and interpolation used by the shelf. The
-        // update sink only records values; no window or system event is used.
-        let animator = ShelfSlideAnimator()
-        defer { animator.cancel() }
-        var positions: [CGFloat] = []
-        var completions = 0
-        animator.animate(from: 0, to: 1, duration: 0.12, curve: .easeOut,
-            update: { positions.append($0) }, completion: { completions += 1 })
-        try waitFor("Shelf entrance animation never completed", timeout: 2) { completions > 0 }
-        try require(positions.count > 2 && positions.contains { $0 > 0 && $0 < 1 },
-                    "Shelf entrance jumped straight to its endpoint")
-        try require(positions.allSatisfy { (0...1).contains($0) }, "Shelf entrance overshot its bounds")
-        try require(zip(positions, positions.dropFirst()).allSatisfy { pair in pair.0 <= pair.1 },
-                    "Shelf entrance moved backwards")
-        try require(positions.last == 1 && completions == 1 && !animator.isAnimating,
-                    "Shelf entrance did not finish once at its exact target")
+    run("compositor slide requests the current screen refresh rate") {
+        let animator = ShelfSlideAnimator(), layer = CALayer()
+        animator.animate(layer: layer, from: -374, to: 0, duration: 0.2, curve: .easeOut) {}
+        let slide = layer.animation(forKey: ShelfSlideAnimator.layerAnimationKey)!
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            let maximum = Float(max(1, screen.maximumFramesPerSecond))
+            try require(slide.preferredFrameRateRange.maximum == maximum && slide.preferredFrameRateRange.preferred == maximum,
+                        "Compositor animation does not request the display maximum")
+        }
+        animator.cancel()
     }
-
-    run("shelf slide driver reverses and cancels without stale completion") {
-        let animator = ShelfSlideAnimator()
-        defer { animator.cancel() }
-        var reversalStart: CGFloat?
-        var reopenedPositions: [CGFloat] = []
-        var closeCompletions = 0, openCompletions = 0
-        animator.animate(from: 1, to: 0, duration: 0.16, curve: .easeIn, update: { value in
-            guard reversalStart == nil, value < 0.8, value > 0 else { return }
-            reversalStart = value
-            // Reverse from the actual sampled position inside an in-flight
-            // update, just as a new presentation supersedes a pending close.
-            animator.animate(from: value, to: 1, duration: 0.10, curve: .easeOut,
-                update: { reopenedPositions.append($0) }, completion: { openCompletions += 1 })
-        }, completion: { closeCompletions += 1 })
-        try waitFor("Reversed shelf animation never completed", timeout: 2) { openCompletions > 0 }
-        guard let reversalStart else { throw SelfTestFailure(description: "No intermediate position was available to reverse") }
-        try require(reopenedPositions.count > 2 && reopenedPositions.allSatisfy { (reversalStart...1).contains($0) },
-                    "Reopening restarted from an endpoint instead of the current position")
-        try require(zip(reopenedPositions, reopenedPositions.dropFirst()).allSatisfy { pair in pair.0 <= pair.1 },
-                    "An old closing tick moved the reopened shelf backwards")
-        try require(reopenedPositions.last == 1 && openCompletions == 1 && closeCompletions == 0 && !animator.isAnimating,
-                    "A superseded closing animation completed after reopening")
-
-        var cancelledUpdates = 0, cancelledCompletions = 0
-        animator.animate(from: 0, to: 1, duration: 0.10, curve: .easeOut, update: { _ in
-            cancelledUpdates += 1
-            animator.cancel()
-        }, completion: { cancelledCompletions += 1 })
-        try waitFor("Cancellation fixture never received a timer update", timeout: 2) { cancelledUpdates > 0 }
-        let cancelledUntil = Date().addingTimeInterval(0.15)
-        try waitFor("Cancellation observation did not finish", timeout: 1) { Date() >= cancelledUntil }
-        try require(cancelledUpdates == 1 && cancelledCompletions == 0 && !animator.isAnimating,
-                    "Cancelled shelf animation continued updating or ran its completion")
+    run("compositor reversal preserves its supplied position and ignores old completions") {
+        let animator = ShelfSlideAnimator(), layer = CALayer()
+        var closed = 0, reopened = 0
+        animator.animate(layer: layer, from: 0, to: -374, duration: 0.2, curve: .easeIn) { closed += 1 }
+        let closing = layer.animation(forKey: ShelfSlideAnimator.layerAnimationKey)!
+        animator.animate(layer: layer, from: -125, to: 0, duration: 0.1, curve: .easeOut) { reopened += 1 }
+        let opening = layer.animation(forKey: ShelfSlideAnimator.layerAnimationKey) as! CABasicAnimation
+        try require((opening.fromValue as? NSNumber)?.doubleValue == -125, "Reversal jumped to an endpoint")
+        closing.delegate?.animationDidStop?(closing, finished: true)
+        try require(closed == 0 && reopened == 0 && animator.isAnimating, "Old completion ended the replacement slide")
+        opening.delegate?.animationDidStop?(opening, finished: true)
+        opening.delegate?.animationDidStop?(opening, finished: true)
+        try require(closed == 0 && reopened == 1 && !animator.isAnimating, "Reopening did not complete exactly once")
     }
 
     run("compositor slide commits endpoints and isolates cancelled completions") {
@@ -757,6 +730,80 @@ func runSelfTests() -> Int32 {
             try require(clip.payloads[0].types["local.prism.clip-id"] == nil, "Internal drag marker leaked into history")
             try require(clip.text == "Only visible text", "Internal marker affected text")
         }
+    }
+
+    run("WeChat temporary image recovery / full-size PNG copy and file drag") {
+        try testWeChatImageRecovery(directory: directory("wechat-recovery"))
+    }
+    run("MIME and Qt image aliases / PNG TIFF JPEG GIF BMP HEIC SVG preservation") {
+        try testImageFormatAliases(directory: directory("image-aliases"))
+    }
+    run("legacy / Qt URI lists / percent-encoded and UTF16 file URLs") {
+        try testFileURLCompatibility(directory: directory("uri-lists"))
+    }
+    run("temporary attachment snapshots survive source deletion / restart / archive") {
+        try testTemporaryAttachmentSnapshots(directory: directory("attachment-snapshots"))
+    }
+    run("PDF / SVG / audio / movie / archive raw data drag exports") {
+        try testEncodedFileExports(directory: directory("encoded-files"))
+    }
+    run("native promised-file import / mixed ordering / sensitive input rejection") {
+        try testFilePromiseImport(directory: directory("promised-import"))
+    }
+    run("named transfer cache / empty and extensionless files / safe filenames") {
+        try testNamedTransferCache(directory: directory("named-cache"))
+    }
+    run("file expiration / large reference / restored path / recoverable attachment") {
+        try testFileReferenceAvailability(directory: directory("file-availability"))
+    }
+    run("asynchronous file status / deletion refresh / cancellation") {
+        try testFileAvailabilityMonitor(directory: directory("file-monitor"))
+    }
+    run("expired card gray overlay / status label / selection / reuse") {
+        try testExpiredCardOverlay(directory: directory("expired-card"))
+    }
+    run("multi-selection double-click / Command and Shift selection / activation") {
+        try testMultiSelectionGestures(directory: directory("multi-gestures"))
+    }
+    run("multi-text paste into native text editor / RTF formatting / HTML") {
+        try testCombinedTextPaste(directory: directory("combined-text"))
+    }
+    run("combined RTFD paste keeps inline attachment and surrounding texts") {
+        try testCombinedAttachmentPaste(directory: directory("combined-attachment"))
+    }
+    run("mixed multi-selection copy and drag / invalid-card skip / ordering") {
+        try testMixedSelectionTransfer(directory: directory("mixed-selection"))
+    }
+    run("raw PDF SVG Office audio archive copy and drag as native files") {
+        try testEncodedFileCopy(directory: directory("encoded-copy"))
+    }
+    run("animated GIF copy and drag retain all frames and original encoding") {
+        try testAnimatedImageTransfer(directory: directory("animated-gif"))
+    }
+    run("bounded inline multi-selection / large file references stay transferable") {
+        try testSelectionMemoryBound(directory: directory("selection-memory"))
+    }
+    if let path = ProcessInfo.processInfo.environment["PRISM_FORMAT_FIXTURE_DIRECTORY"] {
+        run("real codec fixtures / image paste / byte-exact file drag / multi-file clipboard") {
+            try testExternalFormatFixtures(directory: directory("external-formats"), fixtures: URL(fileURLWithPath: path))
+        }
+    }
+
+    run("custom scroll view opts into native responsive scrolling") {
+        try require(ShelfScrollView.isCompatibleWithResponsiveScrolling, "Custom wheel handling disabled responsive scrolling")
+    }
+    run("hidden cards do not preload thumbnails or application icons") {
+        try testHiddenCardDoesNotLoadAssets(directory: directory("asset-demand"))
+    }
+    run("live scrolling defers card repaints until the interaction ends") {
+        try testScrollDefersCardUpdates(directory: directory("scroll-repaints"))
+    }
+
+    run("thumbnail lookahead stays within four neighbors and its payload budget") {
+        try testThumbnailPrefetchBounds()
+    }
+    run("visible thumbnails have priority and retain a decoding slot") {
+        try testVisibleThumbnailPriority()
     }
 
     run("sensitive marker rejection across items") {

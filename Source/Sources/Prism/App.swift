@@ -143,6 +143,7 @@ final class PrismAppDelegate: NSObject, NSApplicationDelegate {
     private var copyProbeGeneration: UInt64 = 0
     private var stackEnabled = false
     private var stackBusy = false
+    private var stackTransferPending = false
     private var stackShortcutHeld = false
     private var stackSession: UInt64 = 0
     private var stackAwaitingPaste: NSRunningApplication?
@@ -317,18 +318,23 @@ final class PrismAppDelegate: NSObject, NSApplicationDelegate {
         guard pb.changeCount == request.count,
               let captured = ClipStore.read(pb, source: request.source, bundle: request.bundle),
               pb.changeCount == request.count else { resolveStackPasteIfReady(); return }
-        guard captured.byteCount <= transientByteBudget - captureBytesInFlight else {
+        let reservation = captured.temporaryCaptureReservation
+        guard reservation <= transientByteBudget - captureBytesInFlight else {
             pendingCapture = request
             if stackEnabled, stackCollecting { stackCollecting = false; toast("连续粘贴收集已暂停，请先粘贴已有队列") }
             return
         }
         if pendingCapture?.count == request.count { pendingCapture = nil }
-        capturesInFlight += 1; captureBytesInFlight += captured.byteCount
+        capturesInFlight += 1; captureBytesInFlight += reservation
         captureQueue.async { [weak self] in
-            autoreleasepool { _ = captured.fingerprint }
+            let captured = autoreleasepool { () -> Clip in
+                let snapshot = captured.preservingTemporaryFiles()
+                _ = snapshot.fingerprint
+                return snapshot
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.capturesInFlight -= 1; self.captureBytesInFlight -= captured.byteCount
+                self.capturesInFlight -= 1; self.captureBytesInFlight -= reservation
                 if request.generation == self.captureGeneration,
                    !self.preferences.paused, !self.isBlocked(request.app) {
                     let id = self.store.add(captured)
@@ -538,37 +544,70 @@ final class PrismAppDelegate: NSObject, NSApplicationDelegate {
         NSApp.windowsMenu = window; NSApp.mainMenu = main
     }
 
-    @discardableResult private func writeClipboard(_ clips: [Clip], plainText: Bool) -> Bool {
+    private func writeClipboard(_ clips: [Clip], plainText: Bool,
+                                isCurrent: @escaping () -> Bool = { true },
+                                completion: @escaping (Bool) -> Void = { _ in }) {
         automaticPastePending = false
         pendingPasteGeneration &+= 1
-        guard !isDemo else { toast("演示模式不会更改系统剪贴板"); return false }
-        guard !clips.isEmpty else { return false }
-        let objects: [NSPasteboardWriting]
+        guard !isDemo else { toast("演示模式不会更改系统剪贴板"); completion(false); return }
+        guard !clips.isEmpty else { completion(false); return }
+        let generation = pendingPasteGeneration
+        let expectedCount = NSPasteboard.general.changeCount
+        let publish: (Result<PreparedTransfer, Error>) -> Void = { [weak self] result in
+            guard let self else { completion(false); return }
+            guard generation == self.pendingPasteGeneration, isCurrent() else { completion(false); return }
+            guard NSPasteboard.general.changeCount == expectedCount else {
+                self.toast("剪贴板已更新，请重新选择要复制的记录")
+                completion(false); return
+            }
+            do {
+                let transfer = try result.get()
+                let objects = transfer.writers
+                guard !objects.isEmpty else {
+                    self.toast(transfer.unavailableClipIDs.isEmpty ? "记录内容无法读取" : "文件已失效")
+                    self.shelf.requestFileAvailabilityRefresh()
+                    completion(false)
+                    return
+                }
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                let success = pb.writeObjects(objects)
+                self.lastChangeCount = pb.changeCount
+                if !success { self.toast("无法写入系统剪贴板，请再试一次") }
+                if success, !transfer.unavailableClipIDs.isEmpty {
+                    self.toast("已跳过 \(transfer.unavailableClipIDs.count) 条失效记录")
+                    self.shelf.requestFileAvailabilityRefresh()
+                }
+                completion(success)
+            } catch {
+                self.toast("无法读取记录内容：\(error.localizedDescription)")
+                completion(false)
+            }
+        }
         if plainText {
             let text = clips.map { clip -> String in
                 if !clip.files.isEmpty { return clip.files.map(\.path).joined(separator: "\n") }
                 if !clip.text.isEmpty { return clip.text }
                 return clip.recognizedText
             }.filter { !$0.isEmpty }.joined(separator: "\n")
-            guard !text.isEmpty else { toast("这些记录没有可复制的文本"); return false }
-            let item = NSPasteboardItem(); item.setString(text, forType: .string); objects = [item]
+            guard !text.isEmpty else { toast("这些记录没有可复制的文本"); completion(false); return }
+            let item = NSPasteboardItem(); item.setString(text, forType: .string)
+            publish(.success(PreparedTransfer(writers: [item], clipIDs: clips.map(\.id), unavailableClipIDs: [])))
         } else {
-            do { objects = try clips.flatMap { try $0.pasteboardWriters() } }
-            catch { toast("无法读取记录内容：\(error.localizedDescription)"); return false }
-            guard !objects.isEmpty else { toast("记录内容无法读取"); return false }
+            FileTransferPreparation.prepareSelection(clips: clips, forDragging: false, completion: publish)
         }
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        let success = pb.writeObjects(objects)
-        lastChangeCount = pb.changeCount
-        if !success { toast("无法写入系统剪贴板，请再试一次") }
-        return success
     }
 
     private func paste(_ clips: [Clip], plainText: Bool) {
-        guard writeClipboard(clips, plainText: plainText || preferences.alwaysPlainText) else { return }
-        shelf.dismiss(animated: false)
         let target = targetApp
+        writeClipboard(clips, plainText: plainText || preferences.alwaysPlainText, completion: { [weak self] success in
+            guard let self, success else { return }
+            self.completePaste(to: target)
+        })
+    }
+
+    private func completePaste(to target: NSRunningApplication?) {
+        shelf.dismiss(animated: false)
         guard let target, !target.isTerminated, !isOwn(target) else { toast("已复制，切换到目标应用后按 ⌘V 粘贴"); return }
         NSApp.yieldActivation(to: target)
         target.activate(options: [])
@@ -699,6 +738,7 @@ final class PrismAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func endStack() {
+        stackTransferPending = false
         stackEnabled = false
         stackQueue.removeAll()
         stackBusy = false
@@ -820,19 +860,30 @@ final class PrismAppDelegate: NSObject, NSApplicationDelegate {
               let clip = entry.snapshot ?? store.clips.first(where: { $0.id == entry.id }) else {
             endStack(); return
         }
-        guard let target, NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier,
-              writeClipboard([clip], plainText: false) else { stackBusy = false; toast("连续粘贴未完成，请再按一次 ⌘V"); return }
-        if sendPasteEvent(to: target) {
-            stackConsumedInStroke = true
-            stackQueue.removeFirst()
-            updateStatus()
+        guard let target, NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier else {
+            stackBusy = false; toast("连续粘贴未完成，请再按一次 ⌘V"); return
         }
-        if !stackShortcutHeld { finishStackStroke() }
+        let session = stackSession
+        stackTransferPending = true
+        writeClipboard([clip], plainText: false, isCurrent: { [weak self] in
+            guard let self else { return false }
+            return self.stackEnabled && self.stackSession == session && self.stackQueue.first?.id == entry.id &&
+                NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier
+        }) { [weak self] success in
+            guard let self, self.stackSession == session else { return }
+            self.stackTransferPending = false
+            if success, self.sendPasteEvent(to: target) {
+                self.stackConsumedInStroke = true
+                self.stackQueue.removeFirst()
+                self.updateStatus()
+            } else { self.stackBusy = false }
+            if !self.stackShortcutHeld { self.finishStackStroke() }
+        }
     }
 
     private func finishStackStroke() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-            guard let self, self.stackEnabled, !self.stackShortcutHeld, self.stackAwaitingPaste == nil else { return }
+            guard let self, self.stackEnabled, !self.stackShortcutHeld, !self.stackTransferPending, self.stackAwaitingPaste == nil else { return }
             self.stackBusy = false
             if self.stackQueue.isEmpty, self.stackConsumedInStroke { self.endStack() }
         }

@@ -178,6 +178,7 @@ final class ShelfPanel: NSPanel {
     override func close() { willHide?(); super.close() }
 }
 final class ShelfScrollView: NSScrollView {
+    override class var isCompatibleWithResponsiveScrolling: Bool { true }
     override func scrollWheel(with event: NSEvent) {
         // Trackpads use AppKit's native momentum and pixel scrolling unchanged.
         if !event.hasPreciseScrollingDeltas && abs(event.scrollingDeltaX) < 0.01 {
@@ -214,7 +215,7 @@ final class BoardButton: NSButton, NSDraggingSource {
         self.board = board; self.shelf = shelf; self.image = image; imagePosition = .imageLeading
         bezelStyle = .accessoryBarAction; isBordered = false; font = .systemFont(ofSize: 13, weight: .medium)
         target = self; action = #selector(choose); setAccessibilityLabel(title)
-        registerForDraggedTypes([boardIDType, clipIDType, .string, .png, .tiff, .fileURL, .URL, .rtf, .html, .pdf])
+        registerForDraggedTypes([boardIDType, clipIDType] + FileTransferImport.draggedTypes)
     }
     @objc func choose() { shelf?.chooseBoard(board) }
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { contentTintColor = .controlAccentColor; return sender.draggingPasteboard.types?.contains(boardIDType) == true ? .move : .copy }
@@ -268,6 +269,9 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
     private let appearanceProvider: () -> PrismAppearanceSettings
     private(set) var appearanceSettings = PrismAppearanceSettings.default
     private var appearanceNeedsUpdate = false
+    private var preparingPresentation = false
+    private let thumbnailPrefetcher = ThumbnailPrefetcher()
+    private var cardAssetRefreshScheduled = false
     let collection = NSCollectionView(); let flow = NSCollectionViewFlowLayout(); let scroll = ShelfScrollView()
     private let root = NSView(); private let toolbar = NSView(); private let tabsScroll = NSScrollView(); private let tabs = NSStackView()
     private let grip = ResizeGrip(); private let empty = NSTextField(wrappingLabelWithString: "")
@@ -280,6 +284,10 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
     private var searchToken: ClipSearchToken?
     private var searchGeneration: UInt64 = 0
     private var tabSignature: [String] = []
+    private let fileAvailability = FileAvailabilityMonitor()
+    private var availabilityTimer: Timer?
+    private var availabilityCheckScheduled = false
+    private(set) var selectionGeneration: UInt64 = 0
     private(set) var visibleItems: [Clip] = []
     var selectedClips: [Clip] { visibleItems.filter { selection.contains($0.id) } }
     var isDragging = false
@@ -296,6 +304,7 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
     private var menuDepth = 0
     private var isMenuOpen: Bool { menuDepth > 0 }
     var isInteracting: Bool { isLiveScrolling || isDragging || slideAnimator.isAnimating }
+    var canLoadCardAssets: Bool { shouldBePresented && !isDragging }
     init(store: ClipStore, actions: ShelfActions, appearanceProvider: @escaping () -> PrismAppearanceSettings = { .default }) {
         self.store = store; self.actions = actions; self.appearanceProvider = appearanceProvider
         let panel = ShelfPanel(contentRect: .init(x: 0, y: 0, width: 1100, height: 374), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -315,12 +324,14 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
         collection.collectionViewLayout = flow; collection.backgroundColors = [.clear]; collection.isSelectable = false
         collection.dataSource = self; collection.delegate = self
         collection.register(CardItem.self, forItemWithIdentifier: cardIdentifier)
-        collection.registerForDraggedTypes([clipIDType, .string, .png, .tiff, .fileURL, .URL, .rtf, .html, .pdf])
+        collection.registerForDraggedTypes([clipIDType] + FileTransferImport.draggedTypes)
         scroll.documentView = collection; scroll.drawsBackground = false; scroll.hasHorizontalScroller = true
         scroll.autohidesScrollers = true; scroll.horizontalScrollElasticity = .allowed; scroll.verticalScrollElasticity = .none
         root.addSubview(scroll)
         NotificationCenter.default.addObserver(self, selector: #selector(scrollStarted), name: NSScrollView.willStartLiveScrollNotification, object: scroll)
         NotificationCenter.default.addObserver(self, selector: #selector(scrollEnded), name: NSScrollView.didEndLiveScrollNotification, object: scroll)
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(self, selector: #selector(scrollBoundsChanged), name: NSView.boundsDidChangeNotification, object: scroll.contentView)
         empty.alignment = .center; empty.textColor = .secondaryLabelColor; empty.font = .systemFont(ofSize: 15); root.addSubview(empty)
         NotificationCenter.default.addObserver(self, selector: #selector(resized), name: NSWindow.didResizeNotification, object: panel)
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown]) { [weak self] e in
@@ -350,7 +361,7 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
         refresh()
     }
     required init?(coder: NSCoder) { fatalError() }
-    deinit { slideAnimator.cancel(); dockPresentation.end(); NSWorkspace.shared.notificationCenter.removeObserver(self); if let localMonitor { NSEvent.removeMonitor(localMonitor) }; if let outsideMonitor { NSEvent.removeMonitor(outsideMonitor) } }
+    deinit { availabilityTimer?.invalidate(); slideAnimator.cancel(); dockPresentation.end(); NSWorkspace.shared.notificationCenter.removeObserver(self); if let localMonitor { NSEvent.removeMonitor(localMonitor) }; if let outsideMonitor { NSEvent.removeMonitor(outsideMonitor) } }
     @objc private func appearanceChanged() {
         if isInteracting { appearanceNeedsUpdate = true; return }
         applyAppearance()
@@ -446,6 +457,7 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
         actions.invalidatePendingPaste()
         guard let window, let host = window.contentView as? ShelfClipView,
               let screen = screenAtPointer() else { return }
+        preparingPresentation = true
         let screenID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
         let continuing = window.isVisible && presentationScreenID == screenID
         let fraction = continuing ? host.visibleFraction : 0
@@ -468,7 +480,10 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
         dockPresentation.begin()
         host.layoutSubtreeIfNeeded()
         host.displayIfNeeded()
+        requestCardAssets()
         animatePresentation(to: 1)
+        preparingPresentation = false
+        drainDeferredRefresh()
     }
 
     private func screenAtPointer() -> NSScreen? {
@@ -487,6 +502,7 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
     /// old visual surface; it never cancels a later paste or activation request.
     func dismiss(animated: Bool = true, restoringFocus: Bool = false) {
         dragSource?.cancelPendingDrag()
+        stopFileAvailabilityChecks()
         actions.invalidatePendingPaste()
         preview?.close(); preview = nil
         guard shouldBePresented else {
@@ -521,7 +537,7 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
         // main-thread callback is needed for the intermediate frames.
         slideAnimator.animate(layer: layer, from: -(1 - start) * host.bounds.height,
                               to: -(1 - target) * host.bounds.height, duration: duration,
-                              curve: target == 1 ? .easeOut : .easeIn,
+                              curve: target == 1 ? .easeOut : .easeIn, window: window,
                               completion: { [weak self, weak window] in
             guard let self, generation == self.presentationGeneration else { return }
             if self.shouldBePresented {
@@ -535,6 +551,7 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
     }
 
     private func panelWillHide() {
+        stopFileAvailabilityChecks()
         // This also handles native close and external-drag exits. Do not touch
         // pending paste generation here: it can belong to a newer request.
         shouldBePresented = false
@@ -601,18 +618,82 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
         isDragging = false; dragSession = nil; dragSource = nil
         drainDeferredRefresh()
     }
-    @objc private func scrollStarted() { isLiveScrolling = true }
+    @objc private func scrollStarted() {
+        isLiveScrolling = true
+        requestCardAssets()
+    }
+    @objc private func scrollBoundsChanged() { requestCardAssets() }
     @objc private func scrollEnded() { isLiveScrolling = false; drainDeferredRefresh() }
     private func drainDeferredRefresh() {
-        if !isInteracting, appearanceNeedsUpdate { applyAppearance() }
-        guard refreshAfterInteraction, !isInteracting else { return }
+        guard !isInteracting, !preparingPresentation else { return }
+        if appearanceNeedsUpdate { applyAppearance() }
+        for item in collection.visibleItems() { (item as? CardItem)?.card.resumeVisibleContent() }
+        requestCardAssets()
+        requestFileAvailabilityRefresh()
+        guard refreshAfterInteraction else { return }
         refreshAfterInteraction = false
         DispatchQueue.main.async { [weak self] in self?.refresh() }
     }
-    func deferCardRefreshIfAnimating() -> Bool {
-        guard slideAnimator.isAnimating else { return false }
-        refreshAfterInteraction = true
-        return true
+    func deferCardRefresh(allowDuringMotion: Bool = false) -> Bool {
+        preparingPresentation || isDragging || (!allowDuringMotion && (isLiveScrolling || slideAnimator.isAnimating))
+    }
+    private func requestCardAssets() {
+        guard canLoadCardAssets, !cardAssetRefreshScheduled else { return }
+        cardAssetRefreshScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.cardAssetRefreshScheduled = false
+            guard self.canLoadCardAssets else { return }
+            let items = self.collection.visibleItems()
+            for item in items { (item as? CardItem)?.card.resumeVisibleContent() }
+            let indices = items.compactMap { self.collection.indexPath(for: $0)?.item }
+            if let first = indices.min(), let last = indices.max() {
+                self.thumbnailPrefetcher.update(items: self.visibleItems, visible: first...last)
+            } else { self.thumbnailPrefetcher.cancel() }
+        }
+    }
+    func requestFileAvailabilityRefresh() {
+        guard shouldBePresented, !isInteracting, !preparingPresentation, !availabilityCheckScheduled else { return }
+        availabilityCheckScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.availabilityCheckScheduled = false
+            guard self.shouldBePresented, !self.isInteracting, !self.preparingPresentation else { return }
+            let clips = self.collection.visibleItems().compactMap { ($0 as? CardItem)?.card.clip }.filter(\.hasFileReferences)
+            guard !clips.isEmpty else {
+                self.fileAvailability.cancel()
+                self.updateAvailabilityTimer(required: false)
+                return
+            }
+            self.fileAvailability.check(clips) { [weak self] states in
+                guard let self, self.shouldBePresented, !self.isDragging else { return }
+                for item in self.collection.visibleItems() {
+                    guard let card = (item as? CardItem)?.card, let clip = card.clip,
+                          let unavailable = states[clip.id] else { continue }
+                    card.setFileUnavailable(unavailable)
+                }
+                self.updateAvailabilityTimer(required: self.fileAvailability.needsPolling)
+            }
+        }
+    }
+    private func updateAvailabilityTimer(required: Bool) {
+        guard required else { availabilityTimer?.invalidate(); availabilityTimer = nil; return }
+        guard availabilityTimer == nil else { return }
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.requestFileAvailabilityRefresh() }
+        timer.tolerance = 0.4
+        RunLoop.main.add(timer, forMode: .common)
+        availabilityTimer = timer
+    }
+    private func stopFileAvailabilityChecks() {
+        thumbnailPrefetcher.cancel()
+        availabilityTimer?.invalidate()
+        availabilityTimer = nil
+        fileAvailability.cancel()
+        for item in collection.visibleItems() {
+            let card = (item as? CardItem)?.card
+            card?.cancelDeferredSelection()
+            card?.suspendVisibleAssets()
+        }
     }
     private func invalidateSearch() {
         searchGeneration &+= 1
@@ -650,8 +731,10 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
         let oldIDs = visibleItems.map(\.id)
         let newIDs = items.map(\.id)
         visibleItems = items
+        let previousSelection = selection
         selection.formIntersection(Set(newIDs))
         if selection.isEmpty, let first = visibleItems.first { selection = [first.id]; anchor = first.id }
+        if selection != previousSelection { selectionGeneration &+= 1 }
         if oldIDs != newIDs {
             collection.reloadData()
         } else {
@@ -666,8 +749,9 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
         }
         empty.isHidden = !visibleItems.isEmpty
         empty.stringValue = search.stringValue.isEmpty && kind == "全部" && source == "全部" && days == 0 ? (board == nil ? "复制一些内容，就会出现在这里\n文本、图片、链接和文件 · ⇧⌘V 随时唤出" : "把卡片拖到这里，留住常用内容") : "没有找到匹配的内容\n试试其他关键词或清除筛选"
+        requestCardAssets()
     }
-    func chooseBoard(_ id: UUID?) { board = id; search.stringValue = ""; kind = "全部"; source = "全部"; days = 0; selection = []; refresh(); scroll.contentView.scroll(to: .zero) }
+    func chooseBoard(_ id: UUID?) { actions.invalidatePendingPaste(); selectionGeneration &+= 1; board = id; search.stringValue = ""; kind = "全部"; source = "全部"; days = 0; selection = []; refresh(); scroll.contentView.scroll(to: .zero) }
     func numberOfSections(in collectionView: NSCollectionView) -> Int { 1 }
     func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int { visibleItems.count }
     func collectionView(_ collectionView: NSCollectionView, itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
@@ -675,7 +759,15 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
         let c = visibleItems[indexPath.item]; item.card.configure(c, selected: selection.contains(c.id), number: indexPath.item < 9 ? indexPath.item + 1 : nil, shelf: self)
         return item
     }
+    func collectionView(_ collectionView: NSCollectionView, willDisplay item: NSCollectionViewItem, forRepresentedObjectAt indexPath: IndexPath) {
+        (item as? CardItem)?.card.resumeVisibleContent()
+    }
+    func collectionView(_ collectionView: NSCollectionView, didEndDisplaying item: NSCollectionViewItem, forRepresentedObjectAt indexPath: IndexPath) {
+        (item as? CardItem)?.card.suspendVisibleAssets()
+    }
     func select(_ c: Clip, event: NSEvent) {
+        actions.invalidatePendingPaste()
+        selectionGeneration &+= 1
         let flags = event.modifierFlags
         if flags.contains(.shift), let anchor, let a = visibleItems.firstIndex(where: { $0.id == anchor }), let b = visibleItems.firstIndex(where: { $0.id == c.id }) {
             selection = Set(visibleItems[min(a,b)...max(a,b)].map(\.id))
@@ -686,12 +778,23 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
     private func updateSelection() {
         for item in collection.visibleItems() { if let card = (item as? CardItem)?.card, let c = card.clip { card.selected = selection.contains(c.id) } }
     }
-    func pasteSelection(plain: Bool = false) { let clips = selectedClips; if !clips.isEmpty { actions.paste(clips, plain) } }
+    func pasteSelection(plain: Bool = false) { selectionGeneration &+= 1; let clips = selectedClips; if !clips.isEmpty { actions.paste(clips, plain) } }
+    func copySelection() { selectionGeneration &+= 1; actions.copy(selectedClips, false) }
+    func activate(_ clip: Clip) {
+        if !selection.contains(clip.id) {
+            selection = [clip.id]
+            anchor = clip.id
+            selectionGeneration &+= 1
+            updateSelection()
+        }
+        pasteSelection()
+    }
     private func move(_ step: Int, extend: Bool) {
         guard !visibleItems.isEmpty else { return }
         let current = visibleItems.firstIndex { $0.id == anchor } ?? 0
         let next = min(visibleItems.count - 1, max(0, current + step)); let c = visibleItems[next]
         if extend { selection.insert(c.id) } else { selection = [c.id] }; anchor = c.id; updateSelection()
+        actions.invalidatePendingPaste(); selectionGeneration &+= 1
         collection.scrollToItems(at: [IndexPath(item: next, section: 0)], scrollPosition: .nearestHorizontalEdge)
     }
     private func handleKey(_ e: NSEvent) -> Bool {
@@ -709,8 +812,8 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
             if let number = Int(key), (1...9).contains(number), visibleItems.count >= number { actions.paste([visibleItems[number - 1]], shift); return true }
             switch key.lowercased() {
             case "f": focusSearch(); return true
-            case "a" where !editing: selection = Set(visibleItems.map(\.id)); updateSelection(); return true
-            case "c" where !editing: actions.copy(selectedClips, false); return true
+            case "a" where !editing: actions.invalidatePendingPaste(); selectionGeneration &+= 1; selection = Set(visibleItems.map(\.id)); updateSelection(); return true
+            case "c" where !editing: copySelection(); return true
             case "e" where !editing: if let c = selectedClips.first { edit(c) }; return true
             case "r" where !editing: if let c = selectedClips.first { rename(c) }; return true
             case "n": if shift { newBoard() } else { edit(nil) }; return true
@@ -772,7 +875,7 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
         paste.keyEquivalentModifierMask = []
         let plain = menu.addAction("以纯文本粘贴", key: "\r") { [weak self] in self?.pasteSelection(plain: true) }
         plain.keyEquivalentModifierMask = [.shift]; plain.isEnabled = ["文本", "富文本", "链接", "文件"].contains(c.kind) || (c.kind == "图片" && !c.recognizedText.isEmpty)
-        menu.addAction("复制", key: "c") { [weak self] in guard let self else { return }; self.actions.copy(self.selectedClips, false) }
+        menu.addAction("复制", key: "c") { [weak self] in self?.copySelection() }
         menu.addItem(.separator())
         menu.addAction("编辑", key: "e") { [weak self] in self?.edit(c) }.isEnabled = ["文本", "富文本", "链接", "图片"].contains(c.kind)
         menu.addAction("重命名", key: "r") { [weak self] in self?.rename(c) }
@@ -819,8 +922,13 @@ final class ShelfController: NSWindowController, NSCollectionViewDataSource, NSC
             if let board { store.pin(ids, board: board) }
             return !ids.isEmpty
         }
-        guard let c = ClipStore.read(pasteboard, source: "拖入的内容", bundle: "") else { return false }
-        store.add(c, board: board); return true
+        return FileTransferImport.receive(pasteboard) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let clip): self.store.add(clip, board: board)
+            case .failure(let error): self.actions.reportError("无法接收文件：\(error.localizedDescription)")
+            }
+        }
     }
     func collectionView(_ collectionView: NSCollectionView, validateDrop draggingInfo: NSDraggingInfo, proposedIndexPath proposedDropIndexPath: AutoreleasingUnsafeMutablePointer<NSIndexPath>, dropOperation proposedDropOperation: UnsafeMutablePointer<NSCollectionView.DropOperation>) -> NSDragOperation { .copy }
     func collectionView(_ collectionView: NSCollectionView, acceptDrop draggingInfo: NSDraggingInfo, indexPath: IndexPath, dropOperation: NSCollectionView.DropOperation) -> Bool {
@@ -893,11 +1001,16 @@ private final class CardTextLayout {
         manager.allowsNonContiguousLayout = true
         manager.addTextContainer(container); storage.addLayoutManager(manager)
     }
-    func setText(_ text: String) {
-        let paragraph = NSMutableParagraphStyle(); paragraph.lineSpacing = 3
+    private static let paragraph: NSParagraphStyle = {
+        let style = NSMutableParagraphStyle()
+        style.lineSpacing = 3
+        return style
+    }()
+    func setText(_ text: String, force: Bool = false) {
+        guard force || storage.string != text else { return }
         storage.setAttributedString(NSAttributedString(string: text, attributes: [
             .font: NSFont.systemFont(ofSize: 14), .foregroundColor: NSColor.labelColor,
-            .paragraphStyle: paragraph
+            .paragraphStyle: Self.paragraph
         ]))
     }
     func draw(in rect: NSRect) {
@@ -914,7 +1027,7 @@ final class ClipCard: NSView, NSDraggingSource {
     private var layoutSize = NSSize.zero
     private var relativeText = ""
     private var footerText = ""
-    private var deferredContentUpdate = false
+    private(set) var deferredContentUpdate = false
     private var cardAccent = NSColor.systemBlue
     private var appearanceSettings = PrismAppearanceSettings.default
     private static let palette: [NSColor] = [
@@ -945,7 +1058,9 @@ final class ClipCard: NSView, NSDraggingSource {
     required init?(coder: NSCoder) { fatalError() }
     override func layout() {
         super.layout()
-        if layoutSize != bounds.size { layoutSize = bounds.size; needsDisplay = true }
+        guard layoutSize != bounds.size else { return }
+        layoutSize = bounds.size
+        needsDisplay = true
         CATransaction.begin(); CATransaction.setDisableActions(true)
         selectionBorder.frame = bounds
         selectionBorder.path = CGPath(roundedRect: bounds.insetBy(dx: 3, dy: 3), cornerWidth: 15, cornerHeight: 15, transform: nil)
@@ -954,7 +1069,7 @@ final class ClipCard: NSView, NSDraggingSource {
     }
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        bodyText.setText(String(clip?.textPreview.prefix(3000) ?? ""))
+        bodyText.setText(String(clip?.textPreview.prefix(3000) ?? ""), force: true)
         updateSelectionBorder(); needsDisplay = true
     }
     var clip: Clip?; weak var shelf: ShelfController?
@@ -963,10 +1078,19 @@ final class ClipCard: NSView, NSDraggingSource {
     private var thumbnail: NSImage?; private var icon: NSImage?; private var mouseOrigin = NSPoint.zero
     private var isDrag = false; private var deferredClick: NSEvent?; private var generation = UUID()
     private var loading: Operation?; private var iconLoading: Operation?
+    private var thumbnailRequested = false
+    private var iconRequested = false
     private var pendingDoubleClick: Bool?
+    private var deferredSelectionWork: DispatchWorkItem?
+    private var selectionClickGeneration: UInt64 = 0
+    private(set) var isFileUnavailable = false
     private var dragShelf: ShelfController?
     private var pendingDragID: UUID?
     private var pendingDragEvent: NSEvent?
+    private var dragReleaseMonitor: Any?
+    private(set) var isMouseDown = false
+    private var hardwareMouseDown = false
+    deinit { if let dragReleaseMonitor { NSEvent.removeMonitor(dragReleaseMonitor) } }
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { false }
     private func updateSelectionBorder() {
@@ -977,10 +1101,17 @@ final class ClipCard: NSView, NSDraggingSource {
         setAccessibilityValue(selected ? "已选中" : "")
     }
     func reset() {
+        cancelDeferredSelection()
         cancelPendingDrag()
-        loading?.cancel(); iconLoading?.cancel(); loading = nil; iconLoading = nil
+        suspendVisibleAssets()
         generation = UUID(); clip = nil; thumbnail = nil; icon = nil; shelf = nil
-        pendingDoubleClick = nil; number = nil; selected = false; deferredContentUpdate = false; bodyText.setText("")
+        pendingDoubleClick = nil; deferredClick = nil; number = nil; selected = false; deferredContentUpdate = false; bodyText.setText("")
+        isMouseDown = false
+        hardwareMouseDown = false
+        isFileUnavailable = false
+        thumbnailRequested = false
+        iconRequested = false
+        setAccessibilityLabel("")
     }
     func configure(_ c: Clip, selected: Bool, number: Int?, shelf: ShelfController) {
         let old = clip
@@ -1002,34 +1133,82 @@ final class ClipCard: NSView, NSDraggingSource {
             var value: UInt64 = 5381; for b in c.bundle.utf8 { value = value &* 33 &+ UInt64(b) }
             let originalAccent = c.kind == "文件" ? NSColor(srgbRed: 0.28, green: 0.43, blue: 0.65, alpha: 1) : Self.palette[Int(value % UInt64(Self.palette.count))]
             cardAccent = appearanceSettings.headerColor(fallback: originalAccent)
-            setAccessibilityLabel("\(c.heading)，\(c.source)，\(c.textPreview.prefix(100))")
+            updateAccessibilityLabel()
             needsDisplay = true
         }
-        if deferredContentUpdate { deferredContentUpdate = false; needsDisplay = true }
         if isNew {
-            loading?.cancel(); iconLoading?.cancel(); thumbnail = nil; icon = nil
-            generation = UUID(); let token = generation
-            if ["图片", "PDF", "文件"].contains(c.kind) {
-                loading = ThumbnailCache.shared.load(c) { [weak self] image in
-                    guard let self, self.generation == token else { return }
-                    self.loading = nil
-                    if let image { self.thumbnail = image; self.imageDidLoad() }
-                }
+            cancelDeferredSelection()
+            setFileUnavailable(false)
+            loading?.cancel(); iconLoading?.cancel()
+            loading = nil; iconLoading = nil
+            generation = UUID()
+            deferredContentUpdate = false
+            let hasThumbnail = ["图片", "PDF", "文件"].contains(c.kind)
+            thumbnail = hasThumbnail ? ThumbnailCache.shared.images.object(forKey: ThumbnailCache.shared.key(c)) : nil
+            icon = c.bundle.isEmpty ? nil : ThumbnailCache.shared.icons.object(forKey: c.bundle as NSString)
+            thumbnailRequested = !hasThumbnail || thumbnail != nil
+            iconRequested = c.bundle.isEmpty || icon != nil
+        }
+        resumeVisibleContent()
+        shelf.requestFileAvailabilityRefresh()
+    }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        loadVisibleAssets()
+    }
+    func resumeVisibleContent() {
+        loadVisibleAssets()
+        guard shelf?.deferCardRefresh() != true else { return }
+        if deferredContentUpdate {
+            deferredContentUpdate = false
+            updateAccessibilityLabel()
+            needsDisplay = true
+        }
+    }
+    func suspendVisibleAssets() {
+        if loading != nil { thumbnailRequested = thumbnail != nil }
+        if iconLoading != nil { iconRequested = icon != nil }
+        loading?.cancel(); iconLoading?.cancel()
+        loading = nil; iconLoading = nil
+    }
+    private func loadVisibleAssets() {
+        guard !thumbnailRequested || !iconRequested,
+              let clip, shelf?.canLoadCardAssets == true, window?.isVisible == true,
+              !isHiddenOrHasHiddenAncestor, !visibleRect.intersection(bounds).isEmpty else { return }
+        let token = generation
+        if !thumbnailRequested {
+            thumbnailRequested = true
+            loading = ThumbnailCache.shared.load(clip) { [weak self] image in
+                guard let self, self.generation == token else { return }
+                self.loading = nil
+                if let image { self.thumbnail = image; self.imageDidLoad(allowDuringMotion: true) }
             }
-            if !c.bundle.isEmpty {
-                iconLoading = ThumbnailCache.shared.icon(c.bundle) { [weak self] image in
-                    guard let self, self.generation == token else { return }
-                    self.iconLoading = nil
-                    if let image { self.icon = image; self.imageDidLoad() }
-                }
+        }
+        if !iconRequested {
+            iconRequested = true
+            iconLoading = ThumbnailCache.shared.icon(clip.bundle) { [weak self] image in
+                guard let self, self.generation == token else { return }
+                self.iconLoading = nil
+                if let image { self.icon = image; self.imageDidLoad(allowDuringMotion: true) }
             }
         }
     }
-    private func imageDidLoad() {
-        if shelf?.deferCardRefreshIfAnimating() == true { deferredContentUpdate = true }
+    func setFileUnavailable(_ unavailable: Bool) {
+        guard unavailable != isFileUnavailable else { return }
+        isFileUnavailable = unavailable
+        if shelf?.deferCardRefresh() != true { updateAccessibilityLabel() }
+        imageDidLoad()
+    }
+    private func updateAccessibilityLabel() {
+        guard let clip else { return }
+        let status = isFileUnavailable ? "，文件已失效" : ""
+        setAccessibilityLabel("\(clip.heading)，\(clip.source)，\(clip.textPreview.prefix(100))\(status)")
+    }
+    private func imageDidLoad(allowDuringMotion: Bool = false) {
+        if shelf?.deferCardRefresh(allowDuringMotion: allowDuringMotion) == true { deferredContentUpdate = true }
         else { needsDisplay = true }
     }
-    override func accessibilityPerformPress() -> Bool { guard let clip, let shelf else { return false }; shelf.actions.paste([clip], false); return true }
+    override func accessibilityPerformPress() -> Bool { guard let clip, let shelf else { return false }; shelf.activate(clip); return true }
     override func draw(_ dirtyRect: NSRect) {
         guard let c = clip else { return }
         let frame = bounds.insetBy(dx: 4, dy: 4)
@@ -1067,6 +1246,12 @@ final class ClipCard: NSView, NSDraggingSource {
         drawText(footerText, rect: NSRect(x: frame.minX + 15, y: frame.maxY - 25, width: frame.width - 62, height: 17), size: 11, color: .secondaryLabelColor)
         if !c.boardIDs.isEmpty { Self.symbols["pin.fill"]?.draw(in: NSRect(x: frame.maxX - 48, y: frame.maxY - 23, width: 11, height: 11), from: .zero, operation: .sourceOver, fraction: 0.55, respectFlipped: true, hints: nil) }
         if let number { drawText("\(number)", rect: NSRect(x: frame.maxX - 29, y: frame.maxY - 25, width: 17, height: 17), size: 11, weight: .medium, color: .tertiaryLabelColor, alignment: .right) }
+        if isFileUnavailable {
+            NSColor.windowBackgroundColor.withAlphaComponent(0.82).setFill()
+            path.fill()
+            drawText("文件已失效", rect: NSRect(x: frame.minX + 15, y: body.midY - 12, width: frame.width - 30, height: 26),
+                     size: 16, weight: .semibold, color: .labelColor, alignment: .center)
+        }
         NSGraphicsContext.restoreGraphicsState()
         NSColor.separatorColor.withAlphaComponent(0.3).setStroke(); path.lineWidth = 0.5; path.stroke()
     }
@@ -1085,16 +1270,22 @@ final class ClipCard: NSView, NSDraggingSource {
         (text as NSString).draw(in: rect, withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: weight), .foregroundColor: color, .paragraphStyle: paragraph])
     }
     override func mouseDown(with event: NSEvent) {
+        cancelDeferredSelection()
         cancelPendingDrag()
         guard let clip else { return }; mouseOrigin = convert(event.locationInWindow, from: nil); isDrag = false
+        isMouseDown = true
+        // Injected pointer events can omit global button state. Retain the
+        // hardware-release check only for gestures that began with that state.
+        hardwareMouseDown = NSEvent.pressedMouseButtons & 1 != 0
         deferredClick = nil; pendingDoubleClick = nil
         let hasModifier = !event.modifierFlags.intersection([.command, .shift]).isEmpty
         if !hasModifier, let shelf, shelf.selectedClips.count > 1, shelf.selectedClips.contains(where: { $0.id == clip.id }) { deferredClick = event }
         else { shelf?.select(clip, event: event) }
         // A second mouse-down can still become a double-click-and-drag.
-        if event.clickCount == 2 { pendingDoubleClick = event.modifierFlags.contains(.shift) }
+        if event.clickCount == 2, !event.modifierFlags.contains(.command) { pendingDoubleClick = event.modifierFlags.contains(.shift) }
     }
     override func mouseUp(with event: NSEvent) {
+        isMouseDown = false
         if pendingDragID != nil {
             cancelPendingDrag(); deferredClick = nil; pendingDoubleClick = nil
             return
@@ -1103,56 +1294,87 @@ final class ClipCard: NSView, NSDraggingSource {
             pendingDoubleClick = nil; deferredClick = nil
             shelf?.pasteSelection(plain: plain); return
         }
-        if !isDrag, let click = deferredClick, let clip { shelf?.select(clip, event: click) }
+        if !isDrag, let click = deferredClick, let clip, let shelf {
+            let generation = self.generation
+            let clickGeneration = selectionClickGeneration
+            let selectionGeneration = shelf.selectionGeneration
+            let work = DispatchWorkItem { [weak self, weak shelf] in
+                guard let self, let shelf, self.generation == generation,
+                      self.selectionClickGeneration == clickGeneration,
+                      shelf.selectionGeneration == selectionGeneration else { return }
+                self.deferredSelectionWork = nil
+                shelf.select(clip, event: click)
+            }
+            deferredSelectionWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + NSEvent.doubleClickInterval, execute: work)
+        }
         deferredClick = nil; pendingDoubleClick = nil
     }
     override func mouseDragged(with event: NSEvent) {
+        cancelDeferredSelection()
+        guard isMouseDown else { return }
         if pendingDragID != nil { pendingDragEvent = event; return }
         let point = convert(event.locationInWindow, from: nil)
         guard !isDrag, hypot(point.x - mouseOrigin.x, point.y - mouseOrigin.y) > 5, let shelf else { return }
         isDrag = true; deferredClick = nil; pendingDoubleClick = nil
         let clips = shelf.selectedClips
-        let items: [NSPasteboardWriting]
-        do { items = try clips.flatMap { try $0.pasteboardWriters(forDragging: true) } }
-        catch { isDrag = false; shelf.actions.reportError("无法拖出记录：\(error.localizedDescription)"); return }
-        guard !items.isEmpty else { isDrag = false; return }
-        let clipIDs = clips.map { $0.id.uuidString }.joined(separator: ",")
+        guard !clips.isEmpty else { isDrag = false; return }
         let request = UUID()
         pendingDragID = request; pendingDragEvent = event
+        dragReleaseMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] _ in
+            self?.isMouseDown = false
+            self?.cancelPendingDrag()
+        }
         // Protect the source during asynchronous disk preparation just as during
         // the native session. Never start a session after release/cancel/reuse.
         dragShelf = shelf; shelf.beginDrag(from: self)
-        ImageDragPreparation.prepare(items) { [weak self] result in
+        FileTransferPreparation.prepareSelection(clips: clips, forDragging: true) { [weak self] result in
             guard let self, self.pendingDragID == request else { return }
             guard self.dragShelf === shelf, shelf.shouldBePresented,
-                  NSEvent.pressedMouseButtons & 1 != 0, let latestEvent = self.pendingDragEvent else {
+                  self.isMouseDown, !self.hardwareMouseDown || NSEvent.pressedMouseButtons & 1 != 0,
+                  let latestEvent = self.pendingDragEvent else {
                 self.cancelPendingDrag(); return
             }
             switch result {
             case .failure(let error):
                 self.cancelPendingDrag()
-                shelf.actions.reportError("无法准备图片拖放：\(error.localizedDescription)")
-            case .success(let writers):
+                shelf.actions.reportError("无法准备拖放内容：\(error.localizedDescription)")
+            case .success(let transfer):
+                guard !transfer.writers.isEmpty else {
+                    self.cancelPendingDrag()
+                    shelf.actions.reportError("文件已失效")
+                    shelf.requestFileAvailabilityRefresh()
+                    return
+                }
+                if !transfer.unavailableClipIDs.isEmpty {
+                    shelf.actions.reportError("已跳过 \(transfer.unavailableClipIDs.count) 条失效记录")
+                }
+                self.stopMonitoringDragRelease()
                 self.pendingDragID = nil; self.pendingDragEvent = nil
-                self.beginPreparedDrag(writers, clipIDs: clipIDs, event: latestEvent, shelf: shelf)
+                self.beginPreparedDrag(transfer.writers, clipIDs: transfer.clipIDs.map { $0.uuidString }.joined(separator: ","), event: latestEvent, shelf: shelf)
             }
         }
     }
+    fileprivate func cancelDeferredSelection() {
+        selectionClickGeneration &+= 1
+        deferredSelectionWork?.cancel()
+        deferredSelectionWork = nil
+    }
     fileprivate func cancelPendingDrag() {
         guard pendingDragID != nil else { return }
+        stopMonitoringDragRelease()
+        isMouseDown = false
         pendingDragID = nil; pendingDragEvent = nil; isDrag = false
         dragShelf?.finishDrag(); dragShelf = nil
+    }
+    private func stopMonitoringDragRelease() {
+        if let dragReleaseMonitor { NSEvent.removeMonitor(dragReleaseMonitor) }
+        dragReleaseMonitor = nil
     }
     private func beginPreparedDrag(_ writers: [NSPasteboardWriting], clipIDs: String, event: NSEvent, shelf: ShelfController) {
         var items = writers
         guard !items.isEmpty else { isDrag = false; shelf.finishDrag(); dragShelf = nil; return }
-        if let promise = items[0] as? ImageDragPromiseProvider {
-            // Keep the provider itself on the pasteboard; AppKit owns its native
-            // promise lifecycle, including writes requested after mouse-up.
-            promise.clipIDs = clipIDs
-        } else {
-            items[0] = ClipDragWriter(writer: items[0], clipIDs: clipIDs)
-        }
+        items[0] = ClipDragWriter(writer: items[0], clipIDs: clipIDs)
         let dragImage = NSImage(size: bounds.size); dragImage.lockFocus(); displayIgnoringOpacity(bounds, in: NSGraphicsContext.current!); dragImage.unlockFocus()
         let dragging = items.enumerated().map { index, item -> NSDraggingItem in
             let drag = NSDraggingItem(pasteboardWriter: item)
@@ -1172,6 +1394,7 @@ final class ClipCard: NSView, NSDraggingSource {
         dragShelf?.trackDrag(session, at: session.draggingLocation)
     }
     func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        isMouseDown = false
         dragShelf?.finishDrag(); dragShelf = nil; isDrag = false; deferredClick = nil
     }
     func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }

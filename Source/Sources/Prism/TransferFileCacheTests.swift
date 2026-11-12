@@ -18,7 +18,7 @@ private func awaitCache(_ done: () -> Bool) throws {
     try cacheRequire(done(), "Image cache completion timed out")
 }
 
-private func prepareCache(_ cache: ImageDragFileCache, _ bytes: Data, ext: String = "png") throws -> Result<URL, Error> {
+private func prepareCache(_ cache: TransferFileCache, _ bytes: Data, ext: String = "png") throws -> Result<URL, Error> {
     var result: Result<URL, Error>?
     var main = false
     cache.prepare(bytes: bytes, fileExtension: ext) { main = Thread.isMainThread; result = $0 }
@@ -33,13 +33,13 @@ private func cacheFailed(_ result: Result<URL, Error>) -> Bool {
 }
 
 /// Uses only disposable caller-owned fixtures and no general pasteboard or UI.
-func testImageDragFileCache(directory: URL) throws {
+func testTransferFileCache(directory: URL) throws {
     precondition(Thread.isMainThread)
     let fm = FileManager.default
     try fm.createDirectory(at: directory, withIntermediateDirectories: true)
     let bytes = Data([0, 1, 2, 3, 255, 137, 80, 78, 71])
     let cacheDirectory = directory.appendingPathComponent("files", isDirectory: true)
-    let cache = ImageDragFileCache(directory: cacheDirectory, byteLimit: 32)
+    let cache = TransferFileCache(directory: cacheDirectory, byteLimit: 32)
     let first = try prepareCache(cache, bytes, ext: "PNG").get()
     try cacheRequire(try Data(contentsOf: first) == bytes, "Cache changed original bytes")
     let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
@@ -53,7 +53,7 @@ func testImageDragFileCache(directory: URL) throws {
     try cacheRequire((try fm.contentsOfDirectory(atPath: cacheDirectory.path)).count == 1, "Reuse left extra files")
     // Releasing an exporter and reading later must preserve receiver access.
     do {
-        let transient = ImageDragFileCache(directory: cacheDirectory, byteLimit: 32)
+        let transient = TransferFileCache(directory: cacheDirectory, byteLimit: 32)
         _ = try prepareCache(transient, bytes).get()
     }
     try cacheRequire(try Data(contentsOf: first) == bytes, "Releasing the exporter deleted the drag file")
@@ -74,14 +74,14 @@ func testImageDragFileCache(directory: URL) throws {
     let unsafeDirectory = directory.appendingPathComponent("symlink", isDirectory: true)
     try fm.createDirectory(at: unsafeDirectory, withIntermediateDirectories: false)
     try fm.createSymbolicLink(at: unsafeDirectory.appendingPathComponent(digest + ".png"), withDestinationURL: original)
-    try cacheRequire(cacheFailed(try prepareCache(ImageDragFileCache(directory: unsafeDirectory), bytes)), "Cache followed a symlink collision")
+    try cacheRequire(cacheFailed(try prepareCache(TransferFileCache(directory: unsafeDirectory), bytes)), "Cache followed a symlink collision")
     try cacheRequire(try Data(contentsOf: original) == bytes, "Cache touched an original outside its directory")
     let linkedDirectory = directory.appendingPathComponent("linked-directory")
     try fm.createSymbolicLink(at: linkedDirectory, withDestinationURL: cacheDirectory)
-    try cacheRequire(cacheFailed(try prepareCache(ImageDragFileCache(directory: linkedDirectory), bytes)), "Cache followed a directory symlink")
-    try cacheRequire(cacheFailed(try prepareCache(ImageDragFileCache(directory: original), bytes)), "Cache accepted a regular file as directory")
+    try cacheRequire(cacheFailed(try prepareCache(TransferFileCache(directory: linkedDirectory), bytes)), "Cache followed a directory symlink")
+    try cacheRequire(cacheFailed(try prepareCache(TransferFileCache(directory: original), bytes)), "Cache accepted a regular file as directory")
 
-    let queued = ImageDragFileCache(directory: directory.appendingPathComponent("queued"))
+    let queued = TransferFileCache(directory: directory.appendingPathComponent("queued"))
     var completions = 0
     var successes: [URL] = []
     var failures = 0

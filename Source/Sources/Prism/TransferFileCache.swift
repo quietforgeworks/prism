@@ -2,10 +2,10 @@ import Foundation
 import CryptoKit
 import Darwin
 
-/// Materialized drag files outlive the drag session: a receiver may open them
-/// after drop. This cache owns only its dedicated directory, never clip history.
-final class ImageDragFileCache {
-    static let shared = ImageDragFileCache()
+/// Materialized files outlive publication so delayed receivers can open them.
+/// This cache owns only its dedicated directory, never clip history.
+final class TransferFileCache {
+    static let shared = TransferFileCache()
     static let maximumPendingBytes: Int64 = 256 * 1024 * 1024
     private static let maximumPendingRequests = 64
     private static let maximumFiles = 4096
@@ -29,28 +29,39 @@ final class ImageDragFileCache {
     private let directory: URL
     private let byteLimit: Int64
     private let retention: TimeInterval
-    private let worker = DispatchQueue(label: "Prism.ImageDragFileCache", qos: .userInitiated)
+    private let worker = DispatchQueue(label: "Prism.TransferFileCache", qos: .userInitiated)
     private let lock = NSLock()
     private var pendingBytes: Int64 = 0
     private var pendingRequests = 0
 
     /// `directory` must be a dedicated cache directory. Test callers may supply
     /// disposable storage. Existing source files must never be placed here.
-    init(directory: URL = ImageDragFileCache.defaultDirectory,
+    init(directory: URL = TransferFileCache.defaultDirectory,
          byteLimit: Int64 = 512 * 1024 * 1024, retention: TimeInterval = 24 * 3600) {
         self.directory = directory
         self.byteLimit = max(0, byteLimit)
         self.retention = max(0, retention)
     }
 
-    func prepare(bytes: Data, fileExtension: String,
+    static func safeFilename(_ value: String) -> String {
+        var name = (value as NSString).lastPathComponent
+            .components(separatedBy: CharacterSet(charactersIn: ":\0\r\n")).joined(separator: "_")
+        if name.isEmpty || name == "." || name == ".." { name = "Prism-file" }
+        let ext = (name as NSString).pathExtension
+        let suffix = ext.isEmpty || ext.utf8.count > 32 ? "" : "." + ext
+        var base = suffix.isEmpty ? name : String(name.dropLast(suffix.count))
+        while (base + suffix).utf8.count > 180 { base.removeLast() }
+        return base + suffix
+    }
+
+    func prepare(bytes: Data, fileExtension: String, filename: String? = nil,
                  completion: @escaping (Result<URL, Error>) -> Void) {
         let ext = fileExtension.lowercased()
-        guard !ext.isEmpty, ext.utf8.count <= 16,
-              ext.utf8.allSatisfy({ (48...57).contains($0) || (97...122).contains($0) }) else {
+        guard filename != nil || (!ext.isEmpty && ext.utf8.count <= 16 &&
+              ext.utf8.allSatisfy({ (48...57).contains($0) || (97...122).contains($0) })) else {
             DispatchQueue.main.async { completion(.failure(CacheError.invalidExtension)) }; return
         }
-        guard !bytes.isEmpty else {
+        guard !bytes.isEmpty || filename != nil else {
             DispatchQueue.main.async { completion(.failure(CacheError.emptyImage)) }; return
         }
         let size = Int64(bytes.count)
@@ -63,7 +74,7 @@ final class ImageDragFileCache {
             DispatchQueue.main.async { completion(.failure(CacheError.pendingLimit)) }; return
         }
         worker.async {
-            let result = Result { try self.materialize(bytes, ext: ext) }
+            let result = Result { try self.materialize(bytes, ext: ext, filename: filename.map(Self.safeFilename)) }
             // The queued main callback retains only the URL/result, not bytes.
             // Retaining the reservation until delivery also bounds callbacks.
             DispatchQueue.main.async {
@@ -100,7 +111,7 @@ final class ImageDragFileCache {
     }
 
     /// Enumerate through the pinned descriptor, never through a replaced path.
-    private func inventory(_ fd: Int32, keeping name: String) throws -> (bytes: Int64, count: Int) {
+    private func inventory(_ fd: Int32, keeping name: String, namedDirectory: Bool = false) throws -> (bytes: Int64, count: Int) {
         let duplicate = dup(fd)
         guard duplicate >= 0 else { throw CacheError.io(errno) }
         guard let stream = fdopendir(duplicate) else { let code = errno; close(duplicate); throw CacheError.io(code) }
@@ -118,9 +129,28 @@ final class ImageDragFileCache {
                 $0.withMemoryRebound(to: CChar.self, capacity: Int(entry.pointee.d_namlen) + 1) { String(cString: $0) }
             }
             if child == "." || child == ".." { continue }
-            guard isOwnedName(child) else { throw CacheError.unsafeEntry }
             var info = stat()
             guard fstatat(fd, child, &info, AT_SYMLINK_NOFOLLOW) == 0 else { throw CacheError.io(errno) }
+            if (info.st_mode & S_IFMT) == S_IFDIR {
+                guard !namedDirectory, info.st_uid == getuid(), child.count == 64,
+                      child.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { throw CacheError.unsafeEntry }
+                let folder = openat(fd, child, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                guard folder >= 0 else { throw CacheError.io(errno) }
+                let prefix = child + "/"
+                let contents: (bytes: Int64, count: Int)
+                do { contents = try inventory(folder, keeping: name.hasPrefix(prefix) ? String(name.dropFirst(prefix.count)) : "", namedDirectory: true) }
+                catch { close(folder); throw error }
+                close(folder)
+                if contents.count == 0 {
+                    guard unlinkat(fd, child, AT_REMOVEDIR) == 0 else { throw CacheError.io(errno) }
+                } else {
+                    guard contents.bytes <= Int64.max - total else { throw CacheError.capacity }
+                    total += contents.bytes; count += contents.count + 1
+                    guard count <= Self.maximumFiles else { throw CacheError.capacity }
+                }
+                continue
+            }
+            guard namedDirectory ? Self.safeFilename(child) == child : isOwnedName(child) else { throw CacheError.unsafeEntry }
             guard (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == getuid(), info.st_nlink == 1,
                   info.st_size >= 0 else { throw CacheError.unsafeEntry }
             let modified = Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1e9
@@ -163,15 +193,29 @@ final class ImageDragFileCache {
         return true
     }
 
-    private func materialize(_ bytes: Data, ext: String) throws -> URL {
-        let name = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined() + "." + ext
-        let fd = try openDirectory()
-        defer { close(fd) }
-        let inventory = try inventory(fd, keeping: name)
+    private func materialize(_ bytes: Data, ext: String, filename: String?) throws -> URL {
+        var digest = SHA256()
+        digest.update(data: bytes)
+        if let filename { digest.update(data: Data([0])); digest.update(data: Data(filename.utf8)) }
+        let hash = digest.finalize().map { String(format: "%02x", $0) }.joined()
+        let name = filename ?? hash + "." + ext
+        let key = filename == nil ? name : hash + "/" + name
+        let root = try openDirectory()
+        defer { close(root) }
+        let inventory = try inventory(root, keeping: key)
         guard inventory.bytes <= byteLimit else { throw CacheError.capacity }
-        if try reuse(name, in: fd, matching: bytes) { return directory.appendingPathComponent(name) }
+        let fd: Int32
+        if filename != nil {
+            if mkdirat(root, hash, 0o700) != 0 && errno != EEXIST { throw CacheError.io(errno) }
+            fd = openat(root, hash, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard fd >= 0 else { throw CacheError.io(errno) }
+        } else { fd = dup(root) }
+        guard fd >= 0 else { throw CacheError.io(errno) }
+        defer { close(fd) }
+        let url = directory.appendingPathComponent(key)
+        if try reuse(name, in: fd, matching: bytes) { return url }
         guard Int64(bytes.count) <= byteLimit, inventory.bytes <= byteLimit - Int64(bytes.count),
-              inventory.count < Self.maximumFiles else { throw CacheError.capacity }
+              inventory.count < Self.maximumFiles - (filename == nil ? 0 : 1) else { throw CacheError.capacity }
         let temporary = ".pending-" + UUID().uuidString
         let file = openat(fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard file >= 0 else { throw CacheError.io(errno) }
@@ -189,6 +233,6 @@ final class ImageDragFileCache {
         guard fsync(file) == 0 else { throw CacheError.io(errno) }
         // Atomic no-replace publication. Never follow or overwrite a collision.
         guard linkat(fd, temporary, fd, name, 0) == 0 else { throw CacheError.io(errno) }
-        return directory.appendingPathComponent(name)
+        return url
     }
 }

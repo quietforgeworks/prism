@@ -1,4 +1,4 @@
-# Prism 1.0.8
+# Prism 1.0.12
 
 Prism is a macOS menu bar clipboard manager with searchable history, categories, favorites, image OCR, backup import and export, and quick paste.
 
@@ -50,7 +50,7 @@ Run the generated app's self-test on a Mac:
 
 ## Current limitations and next steps
 
-Intel Macs and older macOS versions are not supported. Independent fresh-install, upgrade, permission, build, and self-test validation remain incomplete. The next development step is broader installation and permission testing across supported Macs.
+Intel Macs and older macOS versions are not supported. Release build and 55 built-in regression checks passed on an Apple Silicon Mac. The optional external codec-fixture test was not run in this release audit. Independent fresh-install, upgrade, permission, and sustained scrolling validation remain incomplete. The next development step is broader installation and permission testing across supported Macs.
 
 ## License and sources
 
